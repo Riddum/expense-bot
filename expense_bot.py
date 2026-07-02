@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Ledger Bot – with Natural Language, Inline Buttons, and Web App Dashboard.
-Fixed for Python 3.14+ and Render deployment – uses asyncio.run() to avoid RuntimeError.
+Optimized for Render deployment with Gunicorn for Flask.
 """
 
 import os
@@ -11,10 +11,11 @@ import json
 import sqlite3
 import logging
 import asyncio
-import threading
+import signal
 from io import StringIO
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict
+from multiprocessing import Process
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,8 +32,8 @@ if not BOT_TOKEN:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
 
 DB_PATH = os.environ.get("LEDGER_DB_PATH", "ledger.db")
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")  # Change to your hosted URL
-FLASK_PORT = int(os.environ.get("PORT", 5000))  # Render uses PORT env var
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")
+FLASK_PORT = int(os.environ.get("PORT", 5000))
 SYNC_INTERVAL = 60
 
 logging.basicConfig(level=logging.INFO)
@@ -176,7 +177,6 @@ def get_period_data(user_id: int, period: str):
 def get_sheet_client():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if creds_json:
-        import json
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(
             creds_dict,
@@ -274,10 +274,6 @@ def get_data():
             "values": list(cat_totals.values())
         }
     })
-
-def run_flask():
-    """Run Flask on 0.0.0.0 to accept external connections"""
-    flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False, threaded=True)
 
 # ─── TELEGRAM HANDLERS ─────────────────────────────────────
 def make_keyboard():
@@ -474,24 +470,24 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def periodic_sync(application):
+    """Background task to sync with Google Sheets periodically"""
     while True:
-        await asyncio.sleep(SYNC_INTERVAL)
-        conn = get_db()
-        users = conn.execute("SELECT user_id FROM user_settings WHERE sheet_url IS NOT NULL").fetchall()
-        conn.close()
-        for (uid,) in users:
-            try:
-                sync_sheet_to_db(uid)
-            except Exception as e:
-                logger.error(f"Sync error for {uid}: {e}")
+        try:
+            await asyncio.sleep(SYNC_INTERVAL)
+            conn = get_db()
+            users = conn.execute("SELECT user_id FROM user_settings WHERE sheet_url IS NOT NULL").fetchall()
+            conn.close()
+            for (uid,) in users:
+                try:
+                    sync_sheet_to_db(uid)
+                except Exception as e:
+                    logger.error(f"Sync error for {uid}: {e}")
+        except Exception as e:
+            logger.error(f"Periodic sync error: {e}")
 
-# ─── MAIN ───────────────────────────────────────────────────
-async def main_async():
-    # Start Flask API in a separate thread (non-blocking)
-    thread = threading.Thread(target=run_flask, daemon=True)
-    thread.start()
-    logger.info("Flask API started on port %d", FLASK_PORT)
-
+# ─── TELEGRAM BOT ENTRY ─────────────────────────────────────
+async def main_telegram():
+    """Run the Telegram bot"""
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -511,8 +507,9 @@ async def main_async():
     logger.info("Telegram bot started and listening for updates...")
     await app.run_polling()
 
-def main():
-    asyncio.run(main_async())
-
-if __name__ == "__main__":
-    main()
+def run_telegram_bot():
+    """Entry point for Telegram bot in a separate process"""
+    try:
+        asyncio.run(main_telegram())
+    except KeyboardInterrupt:
+        logger.info("Bot interrupted")

@@ -4,11 +4,25 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python expense_bot.py
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 0 'expense_bot:flask_app'
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         scope: run
       - key: WEBAPP_URL
+        scope: run
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        scope: run
+      
+  - type: background
+    name: telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        scope: run
+      - key: LEDGER_DB_PATH
         scope: run
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         scope: run
