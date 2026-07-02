@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Ledger Bot – with Natural Language, Inline Buttons, and Web App Dashboard.
+Fixed for Python 3.14+ and Render deployment – uses asyncio.run() to avoid RuntimeError.
 """
 
 import os
@@ -31,7 +32,7 @@ if not BOT_TOKEN:
 
 DB_PATH = os.environ.get("LEDGER_DB_PATH", "ledger.db")
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")  # Change to your hosted URL
-FLASK_PORT = int(os.environ.get("FLASK_PORT", 5000))
+FLASK_PORT = int(os.environ.get("PORT", 5000))  # Render uses PORT env var
 SYNC_INTERVAL = 60
 
 logging.basicConfig(level=logging.INFO)
@@ -176,9 +177,11 @@ def get_sheet_client():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if creds_json:
         import json
-        from oauth2client.client import GoogleCredentials
         creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            creds_dict,
+            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        )
     else:
         creds = ServiceAccountCredentials.from_json_keyfile_name(
             os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json"),
@@ -238,6 +241,11 @@ def sync_sheet_to_db(user_id: int):
 # ─── FLASK API FOR WEB APP ─────────────────────────────────
 flask_app = Flask(__name__)
 
+@flask_app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for Render"""
+    return jsonify({"status": "ok"}), 200
+
 @flask_app.route("/data", methods=["GET"])
 def get_data():
     user_id = request.args.get("user_id")
@@ -268,7 +276,8 @@ def get_data():
     })
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+    """Run Flask on 0.0.0.0 to accept external connections"""
+    flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False, threaded=True)
 
 # ─── TELEGRAM HANDLERS ─────────────────────────────────────
 def make_keyboard():
@@ -477,10 +486,11 @@ async def periodic_sync(application):
                 logger.error(f"Sync error for {uid}: {e}")
 
 # ─── MAIN ───────────────────────────────────────────────────
-def main():
-    # Start Flask API in a separate thread
+async def main_async():
+    # Start Flask API in a separate thread (non-blocking)
     thread = threading.Thread(target=run_flask, daemon=True)
     thread.start()
+    logger.info("Flask API started on port %d", FLASK_PORT)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -495,11 +505,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(periodic_sync(app))
+    # Start the background sync task
+    asyncio.create_task(periodic_sync(app))
 
-    logger.info("Bot started with Flask API on port %d", FLASK_PORT)
-    app.run_polling()
+    logger.info("Telegram bot started and listening for updates...")
+    await app.run_polling()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
