@@ -20,7 +20,7 @@ from expense_bot import flask_app, run_telegram_bot, FLASK_PORT
 # Global references for signal handler
 processes = []
 
-def shutdown(signum=None, frame=None):
+def shutdown(signum=None, frame=None, exit_code=0):
     """Terminate child processes gracefully"""
     logger.info("Shutting down child processes...")
     for p in processes:
@@ -30,7 +30,7 @@ def shutdown(signum=None, frame=None):
             if p.is_alive():
                 p.kill()
     logger.info("All processes terminated.")
-    sys.exit(0)
+    sys.exit(exit_code)
 
 def run_flask_process():
     """Run Flask API (blocking)"""
@@ -60,9 +60,18 @@ def main():
         time.sleep(1)  # let Flask bind port
         telegram_process.start()
 
-        # Wait for both processes to finish (they run until interrupted)
-        flask_process.join()
-        telegram_process.join()
+        # Poll both processes. If either dies unexpectedly, tear the whole
+        # service down and exit non-zero so Render restarts it cleanly --
+        # previously this only ever joined on Flask, so a crashed Telegram
+        # process went unnoticed forever while Flask kept running alone.
+        while True:
+            time.sleep(5)
+            if not flask_process.is_alive():
+                logger.error("Flask process died unexpectedly. Shutting down.")
+                shutdown(exit_code=1)
+            if not telegram_process.is_alive():
+                logger.error("Telegram process died unexpectedly. Shutting down.")
+                shutdown(exit_code=1)
 
     except KeyboardInterrupt:
         shutdown()
