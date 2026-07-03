@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ledger Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f1214;
+      color: #e8e6e0;
+      padding: 16px;
+      min-height: 100vh;
+    }
+    .container { max-width: 600px; margin: 0 auto; }
+    h1 { font-size: 24px; font-weight: 600; margin-bottom: 16px; color: #c9a227; }
+    .card {
+      background: #1a1f22;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+      border: 1px solid #2a3135;
+    }
+    .total { font-size: 32px; font-weight: 700; color: #c9a227; }
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    .filters button {
+      background: #2a3135;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 20px;
+      color: #c9a227;
+      font-weight: 500;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    .filters button.active { background: #c9a227; color: #0f1214; }
+    .transaction {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #2a3135;
+      font-size: 14px;
+    }
+    .transaction .note { flex: 1; }
+    .transaction .amt { font-weight: 600; }
+    .transaction .cat {
+      background: #2a3135;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      margin: 0 8px;
+    }
+    .chart-container { height: 180px; margin: 16px 0; }
+    #list { max-height: 400px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>📒 Ledger</h1>
+  <div class="card">
+    <div class="total" id="total">₹0</div>
+    <div class="filters">
+      <button data-period="today">Today</button>
+      <button data-period="week" class="active">Week</button>
+      <button data-period="month">Month</button>
+      <button data-period="all">All</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="chart-container"><canvas id="chart"></canvas></div>
+  </div>
+  <div class="card">
+    <div id="list"></div>
+  </div>
+</div>
+<script>
+  const BASE_URL = 'https://expense-bot-zc62.onrender.com'; // replace with your Flask API URL (Render URL)
+  let transactions = [];
+  let chart = null;
+  let currentPeriod = 'week';
+
+  function getUserId() {
+    // In Telegram Web App, we can get user id from the WebApp object
+    if (window.Telegram && Telegram.WebApp) {
+      return Telegram.WebApp.initDataUnsafe.user.id;
+    }
+    // fallback: ask user to input
+    return prompt('Enter your user ID (from /start)') || '0';
+  }
+
+  async function fetchData(period) {
+    const userId = getUserId();
+    const url = `${BASE_URL}/data?user_id=${userId}&period=${period}`;
+    const res = await fetch(url);
+    return await res.json();
+  }
+
+  function render(data) {
+    const totalEl = document.getElementById('total');
+    const listEl = document.getElementById('list');
+    const total = data.total || 0;
+    totalEl.textContent = `₹${total.toLocaleString()}`;
+
+    // Chart
+    const ctx = document.getElementById('chart').getContext('2d');
+    if (chart) chart.destroy();
+    const labels = data.chartData.labels || [];
+    const values = data.chartData.values || [];
+    chart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Spending',
+          data: values,
+          backgroundColor: '#c9a227',
+          borderRadius: 4
+        }]
+      },
+      options: {
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#8fa095', font: { size: 10 } }, grid: { display: false } },
+          y: { ticks: { color: '#8fa095', font: { size: 10 } }, grid: { color: '#2a3135' } }
+        }
+      }
+    });
+
+    // List
+    listEl.innerHTML = data.transactions.map(t => `
+      <div class="transaction">
+        <span class="note">${t.note}</span>
+        <span class="cat">${t.category}</span>
+        <span class="amt">₹${t.amount.toLocaleString()}</span>
+      </div>
+    `).join('');
+  }
+
+  async function load(period) {
+    const data = await fetchData(period);
+    render(data);
+  }
+
+  document.querySelectorAll('.filters button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentPeriod = btn.dataset.period;
+      load(currentPeriod);
+    });
+  });
+
+  // Initial load
+  load('week');
+
+  // Telegram WebApp ready
+  if (window.Telegram && Telegram.WebApp) {
+    Telegram.WebApp.ready();
+  }
+</script>
+</body>
+</html>
