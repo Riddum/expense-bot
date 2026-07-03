@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Ledger Bot – with Natural Language, Inline Buttons, and Web App Dashboard.
-Optimized for Render deployment with Gunicorn for Flask.
+Optimized for Render deployment with multiprocessing.
 """
-
 import os
 import re
 import csv
@@ -11,15 +10,14 @@ import json
 import sqlite3
 import logging
 import asyncio
-import signal
 from io import StringIO
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict
-from multiprocessing import Process
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -110,13 +108,7 @@ def add_expense(user_id: int, note: str, amount: float, when: str = None, user_c
     conn.commit()
     new_id = cur.lastrowid
     conn.close()
-    # Sync to Google Sheet if linked
-    url = get_sheet_url(user_id)
-    if url:
-        try:
-            append_to_sheet(url, [when, note, amount, final_cat])
-        except Exception as e:
-            logger.error(f"Sheet append failed: {e}")
+    # DO NOT SYNC HERE – let periodic sync handle it to avoid blocking
     return final_cat
 
 def get_transactions(user_id: int, start_date: str = None, end_date: str = None) -> List[Dict]:
@@ -183,14 +175,22 @@ def get_sheet_client():
             ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         )
     else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json"),
-            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        )
+        # fallback to file (local dev only)
+        creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(
+                creds_file,
+                ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            )
+        except FileNotFoundError:
+            logger.warning("Google service account credentials not found. Sheet sync disabled.")
+            return None
     return gspread.authorize(creds)
 
 def open_sheet(url):
     client = get_sheet_client()
+    if client is None:
+        raise RuntimeError("No Google Sheets client")
     return client.open_by_url(url).sheet1
 
 def append_to_sheet(url, row):
@@ -216,6 +216,7 @@ def sync_sheet_to_db(user_id: int):
                 amount = float(amt_str)
             except ValueError:
                 continue
+            # check if already exists (by date, note, amount)
             cur.execute(
                 "SELECT id, sheet_row FROM expenses WHERE user_id=? AND date=? AND note=? AND amount=?",
                 (user_id, date_str, note, amount)
@@ -240,10 +241,10 @@ def sync_sheet_to_db(user_id: int):
 
 # ─── FLASK API FOR WEB APP ─────────────────────────────────
 flask_app = Flask(__name__)
+CORS(flask_app)  # enable CORS for all routes
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint for Render"""
     return jsonify({"status": "ok"}), 200
 
 @flask_app.route("/data", methods=["GET"])
@@ -256,11 +257,9 @@ def get_data():
     except ValueError:
         return jsonify({"error": "Invalid user_id"}), 400
 
-    # Fetch all transactions for this user (last 90 days to limit)
     rows = get_transactions(uid, start_date=(date.today() - timedelta(days=90)).isoformat())
     total = sum(r["amount"] for r in rows)
 
-    # Category totals
     cat_totals = {}
     for r in rows:
         cat_totals[r["category"]] = cat_totals.get(r["category"], 0) + r["amount"]
@@ -328,7 +327,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Unknown action")
 
 # ─── NATURAL LANGUAGE PARSING ─────────────────────────────
-# Patterns: "bb 150", "150 bb", "bb 150 groceries", "150 bb groceries"
+# More flexible regex: allows optional category at the end
 PARSE_PATTERN = re.compile(
     r"^\s*(?:(\d+(?:\.\d+)?)\s+([\w\s&]+?)(?:\s+([\w\s&]+))?|([\w\s&]+?)\s+(\d+(?:\.\d+)?)(?:\s+([\w\s&]+))?)$"
 )
@@ -338,14 +337,11 @@ def parse_message(text: str):
     m = PARSE_PATTERN.match(text)
     if not m:
         return None
-    # Group structure: (amt1, note1, cat1, note2, amt2, cat2)
     if m.group(1) is not None:
-        # amount first
         amount = float(m.group(1))
         note = m.group(2).strip()
         category = m.group(3).strip() if m.group(3) else None
     else:
-        # note first
         note = m.group(4).strip()
         amount = float(m.group(5))
         category = m.group(6).strip() if m.group(6) else None
@@ -364,7 +360,6 @@ async def handle_plain_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(reply, reply_markup=make_keyboard())
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Fallback command if user still uses /add
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text("Usage: /add 150 bb")
@@ -390,7 +385,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=make_keyboard()
     )
 
-# ─── OTHER COMMANDS ────────────────────────────────────────
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
