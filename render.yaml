@@ -8,14 +8,10 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         scope: run
+      - key: PYTHON_VERSION
+        value: 3.12.7
+        scope: run
       - key: WEBAPP_URL
         scope: run
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         scope: run
-      - key: LEDGER_DB_PATH
-        value: /data/ledger.db
-        scope: run
-    disk:
-      name: ledger-data
-      mountPath: /data
-      sizeGB: 1
