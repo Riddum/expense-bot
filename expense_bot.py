@@ -250,6 +250,7 @@ def health_check():
 @flask_app.route("/data", methods=["GET"])
 def get_data():
     user_id = request.args.get("user_id")
+    period = request.args.get("period", "all")
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
     try:
@@ -257,7 +258,16 @@ def get_data():
     except ValueError:
         return jsonify({"error": "Invalid user_id"}), 400
 
-    rows = get_transactions(uid, start_date=(date.today() - timedelta(days=90)).isoformat())
+    if period == "today":
+        start_date = date.today().isoformat()
+    elif period == "week":
+        start_date = (date.today() - timedelta(days=date.today().weekday())).isoformat()
+    elif period == "month":
+        start_date = date.today().replace(day=1).isoformat()
+    else:  # "all" or unrecognized -> no lower bound
+        start_date = None
+
+    rows = get_transactions(uid, start_date=start_date)
     total = sum(r["amount"] for r in rows)
 
     cat_totals = {}
