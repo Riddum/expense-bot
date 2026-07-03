@@ -490,9 +490,20 @@ async def periodic_sync(application):
             logger.error(f"Periodic sync error: {e}")
 
 # ─── TELEGRAM BOT ENTRY ─────────────────────────────────────
-async def main_telegram():
-    """Run the Telegram bot"""
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def _post_init(app):
+    """PTB calls this once, after initialize() but before polling starts.
+    This is the correct place to schedule background asyncio tasks --
+    run_polling() owns the event loop, so we can't create tasks before it."""
+    asyncio.create_task(periodic_sync(app))
+
+def main_telegram():
+    """Run the Telegram bot.
+    IMPORTANT: run_polling() is a BLOCKING call that creates and manages its
+    own event loop internally. It must be called directly, never awaited
+    inside asyncio.run()/another coroutine -- doing so causes PTB to crash
+    with 'RuntimeError: Cannot close a running event loop' once it tries to
+    tear down a loop that asyncio.run() is still managing."""
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -505,15 +516,12 @@ async def main_telegram():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Start the background sync task
-    asyncio.create_task(periodic_sync(app))
-
     logger.info("Telegram bot started and listening for updates...")
-    await app.run_polling()
+    app.run_polling()
 
 def run_telegram_bot():
     """Entry point for Telegram bot in a separate process"""
     try:
-        asyncio.run(main_telegram())
+        main_telegram()
     except KeyboardInterrupt:
         logger.info("Bot interrupted")
