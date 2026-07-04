@@ -17,7 +17,7 @@ from typing import Optional, List, Dict
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory   # <-- ADDED send_from_directory
 from flask_cors import CORS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
@@ -34,7 +34,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Set DATABASE_URL environment variable (e.g. a free Neon Postgres connection string).")
 
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")  # <-- CHANGE THIS in Render to your base URL
 FLASK_PORT = int(os.environ.get("PORT", 5000))
 SYNC_INTERVAL = 60
 
@@ -280,6 +280,13 @@ def sync_sheet_to_db(user_id: int):
 # ─── FLASK API FOR WEB APP ─────────────────────────────────
 flask_app = Flask(__name__)
 CORS(flask_app)  # enable CORS for all routes
+
+# ---------- NEW ROUTE TO SERVE THE DASHBOARD HTML ----------
+@flask_app.route('/')
+def serve_dashboard():
+    """Serve the index.html dashboard."""
+    return send_from_directory('.', 'index.html')
+# -----------------------------------------------------------
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
