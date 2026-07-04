@@ -2,6 +2,7 @@
 """
 Ledger Bot – with Natural Language, Inline Buttons, and Web App Dashboard.
 Optimized for Render deployment with multiprocessing.
+Now supports standard Excel import/export with ID column for editing.
 """
 import os
 import re
@@ -11,19 +12,23 @@ import logging
 import asyncio
 import psycopg2
 import psycopg2.extras
-from io import StringIO
+from io import StringIO, BytesIO
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from flask import Flask, request, jsonify, send_from_directory   # <-- ADDED send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+
+# Import openpyxl for Excel support
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
 
 # ─── CONFIG ──────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -34,7 +39,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Set DATABASE_URL environment variable (e.g. a free Neon Postgres connection string).")
 
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")  # <-- CHANGE THIS in Render to your base URL
+WEBAPP_URL = "https://expense-bot-zc62.onrender.com"
 FLASK_PORT = int(os.environ.get("PORT", 5000))
 SYNC_INTERVAL = 60
 
@@ -142,8 +147,22 @@ def add_expense(user_id: int, note: str, amount: float, when: str = None, user_c
         new_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
-    # DO NOT SYNC HERE – let periodic sync handle it to avoid blocking
     return final_cat
+
+def update_expense(user_id: int, tx_id: int, date_str: str, note: str, amount: float, category: str, event: str = None):
+    """Update an existing expense (category may be user-provided or auto)"""
+    # If category is not in ALL_CATEGORIES, auto-categorize
+    if category not in ALL_CATEGORIES:
+        category = categorize(note)
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE expenses SET date=%s, note=%s, amount=%s, category=%s, user_category=%s, event=%s "
+            "WHERE id=%s AND user_id=%s",
+            (date_str, note, amount, category, category, event, tx_id, user_id)
+        )
+    conn.commit()
+    conn.close()
 
 def get_transactions(user_id: int, start_date: str = None, end_date: str = None) -> List[Dict]:
     conn = get_db()
@@ -214,7 +233,6 @@ def get_sheet_client():
             ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         )
     else:
-        # fallback to file (local dev only)
         creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name(
@@ -279,14 +297,11 @@ def sync_sheet_to_db(user_id: int):
 
 # ─── FLASK API FOR WEB APP ─────────────────────────────────
 flask_app = Flask(__name__)
-CORS(flask_app)  # enable CORS for all routes
+CORS(flask_app)
 
-# ---------- NEW ROUTE TO SERVE THE DASHBOARD HTML ----------
 @flask_app.route('/')
 def serve_dashboard():
-    """Serve the index.html dashboard."""
     return send_from_directory('.', 'index.html')
-# -----------------------------------------------------------
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
@@ -309,7 +324,7 @@ def get_data():
         start_date = (date.today() - timedelta(days=date.today().weekday())).isoformat()
     elif period == "month":
         start_date = date.today().replace(day=1).isoformat()
-    else:  # "all" or unrecognized -> no lower bound
+    else:
         start_date = None
 
     rows = get_transactions(uid, start_date=start_date)
@@ -385,15 +400,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Unknown action")
 
 # ─── NATURAL LANGUAGE PARSING ─────────────────────────────
-# Supported shapes (amount can be first, last, or in the middle):
-#   "150 bb"                -> amount=150, note=bb
-#   "bb 150"                -> amount=150, note=bb
-#   "rent 17000"            -> amount=17000, note=rent
-#   "ice cream 200 snacks"  -> note="ice cream", amount=200, event="snacks"
-#   "150 bb may"            -> note=bb, amount=150, dated within May
-#   "150 bb interview may"  -> note=bb, amount=150, event="interview", dated within May
 def parse_message(text: str):
-    """Returns (amount, note, event, month_num) or None."""
     tokens = text.strip().split()
     if not tokens:
         return None
@@ -484,19 +491,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/start – welcome\n"
         "/help – this help\n"
-        "/delete <id> – remove a transaction\n"
+        "/delete <id> – delete a transaction\n"
         "/setcat <id> <category> – change category\n"
         "/listcats – show all categories\n"
         "/setsheet <url> – link Google Sheet\n"
-        "/export – CSV export\n\n"
+        "/export – download full ledger as Excel (.xlsx) – you can edit and re-upload it\n"
+        "/exportcsv – download as CSV (legacy)\n\n"
         "Add expenses by just typing, e.g.:\n"
         "  • bb 150\n"
         "  • 150 rapido\n"
         "  • 150 bb may – logs it dated within May\n"
-        "  • 150 bb interview may – tags it with the 'interview' "
-        "event, still counted in May's total\n\n"
-        "📎 Send an .xlsx file directly to bulk-import expenses "
-        "(first column = note, other columns = month names or event names)."
+        "  • 150 bb interview may – tags it with the 'interview' event\n\n"
+        "📎 Send an .xlsx file to import:\n"
+        "  • Old format: first column = note, other columns = month/event names.\n"
+        "  • New format (editable): columns = id, date, note, amount, category, event.\n"
+        "    Leave 'id' blank to add new rows; edit existing rows to update them."
     )
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,7 +555,50 @@ async def cmd_setsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Sync error: {e}")
 
+# ─── NEW: EXPORT AS EXCEL (with ID column) ─────────────────
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = get_transactions(user_id)
+    if not rows:
+        await update.message.reply_text("Nothing to export.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Expenses"
+
+    # Headers
+    headers = ["id", "date", "note", "amount", "category", "event"]
+    ws.append(headers)
+
+    for r in rows:
+        ws.append([
+            r["id"],
+            r["date"],
+            r["note"],
+            r["amount"],
+            r["category"],
+            r["event"] or ""
+        ])
+
+    # Auto-width columns
+    for col in range(1, len(headers)+1):
+        col_letter = get_column_letter(col)
+        ws.column_dimensions[col_letter].width = 15
+
+    # Save to BytesIO
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    await update.message.reply_document(
+        document=output,
+        filename="expenses.xlsx",
+        caption="📊 Full ledger – edit and re-upload to update expenses."
+    )
+
+# ─── LEGACY CSV EXPORT (optional) ─────────────────────────
+async def cmd_exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = get_transactions(user_id)
     if not rows:
@@ -554,28 +606,146 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     buf = StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["date", "note", "amount", "category", "event"])
+    writer.writerow(["id", "date", "note", "amount", "category", "event"])
     for r in rows:
-        writer.writerow([r["date"], r["note"], r["amount"], r["category"], r["event"] or ""])
+        writer.writerow([r["id"], r["date"], r["note"], r["amount"], r["category"], r["event"] or ""])
     buf.seek(0)
     await update.message.reply_document(
         document=buf.getvalue().encode(),
         filename="expenses.csv",
-        caption="All transactions."
+        caption="CSV export (read-only, use Excel export for editing)."
     )
 
-# ─── XLSX IMPORT ────────────────────────────────────────────
-# Bulk-import a spreadsheet shaped like: first column = expense note,
-# other columns = month names ("may", "june", ...) each holding amounts,
-# plus optional "event" columns (e.g. "interview day") whose amounts get
-# tagged with that event and dated using whichever month column has data
-# in the same row (or the nearest preceding month column as a fallback).
-def _nearest_preceding_month(col_info, idx):
-    for i in range(idx - 1, -1, -1):
-        if col_info[i][0] == "month":
-            return col_info[i][1]
-    return None
+# ─── UPDATED IMPORT: Detect format and handle update/insert ─
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.file_name.lower().endswith((".xlsx", ".xls")):
+        await update.message.reply_text("Please send an .xlsx file.")
+        return
 
+    await update.message.reply_text("📥 Processing file...")
+    user_id = update.effective_user.id
+
+    try:
+        file = await doc.get_file()
+        file_bytes = bytes(await file.download_as_bytearray())
+        wb = load_workbook(BytesIO(file_bytes), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            await update.message.reply_text("File is empty.")
+            return
+
+        # Detect format: check first row for "id" column
+        header = [str(cell).strip().lower() if cell else "" for cell in rows[0]]
+        is_editable_format = "id" in header
+
+        if is_editable_format:
+            # --- New format: id, date, note, amount, category, event ---
+            # Map column indices
+            col_map = {}
+            for idx, h in enumerate(header):
+                if h == "id": col_map["id"] = idx
+                elif h == "date": col_map["date"] = idx
+                elif h == "note": col_map["note"] = idx
+                elif h == "amount": col_map["amount"] = idx
+                elif h == "category": col_map["category"] = idx
+                elif h == "event": col_map["event"] = idx
+
+            required = ["date", "note", "amount"]
+            if not all(k in col_map for k in required):
+                await update.message.reply_text(
+                    "Missing required columns: date, note, amount. Please include them."
+                )
+                return
+
+            inserted = 0
+            updated = 0
+            skipped = 0
+
+            for row in rows[1:]:
+                # Skip completely empty rows
+                if not any(cell for cell in row):
+                    skipped += 1
+                    continue
+
+                # Extract values
+                def get_val(col_name):
+                    idx = col_map.get(col_name)
+                    if idx is None or idx >= len(row):
+                        return None
+                    return row[idx]
+
+                tx_id = get_val("id")
+                date_str = get_val("date")
+                note = get_val("note")
+                amount_val = get_val("amount")
+                category = get_val("category") or ""
+                event = get_val("event") or ""
+
+                # Validate
+                if not note or amount_val is None:
+                    skipped += 1
+                    continue
+                try:
+                    amount = float(amount_val)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if not date_str:
+                    date_str = date.today().isoformat()
+                else:
+                    # try to parse; if invalid, use today
+                    try:
+                        datetime.strptime(date_str, "%Y-%m-%d")
+                    except ValueError:
+                        date_str = date.today().isoformat()
+
+                # If id exists, update
+                if tx_id:
+                    try:
+                        tx_id_int = int(tx_id)
+                        # Check if it belongs to this user
+                        conn = get_db()
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT id FROM expenses WHERE id=%s AND user_id=%s", (tx_id_int, user_id))
+                            exists = cur.fetchone()
+                        conn.close()
+                        if exists:
+                            # Update
+                            update_expense(user_id, tx_id_int, date_str, note, amount, category, event)
+                            updated += 1
+                        else:
+                            # ID doesn't belong to user – insert as new (ignore id)
+                            add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
+                            inserted += 1
+                    except ValueError:
+                        # invalid id – treat as new
+                        add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
+                        inserted += 1
+                else:
+                    # New row
+                    add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
+                    inserted += 1
+
+            msg = f"✅ Import complete: {inserted} new, {updated} updated."
+            if skipped:
+                msg += f" Skipped {skipped} rows (empty or invalid)."
+            await update.message.reply_text(msg, reply_markup=make_keyboard())
+
+        else:
+            # --- Old format: month-based import (first column = note) ---
+            imported, skipped = import_expenses_from_xlsx(user_id, file_bytes)
+            msg = f"✅ Imported {imported} transaction(s)."
+            if skipped:
+                msg += f" Skipped {skipped} row(s) with no note or invalid data."
+            await update.message.reply_text(msg, reply_markup=make_keyboard())
+
+    except Exception as e:
+        logger.error(f"Import failed for {user_id}: {e}")
+        await update.message.reply_text(f"❌ Import failed: {e}")
+
+# ─── OLD XLSX IMPORT (month-based) – kept for backward compatibility ─
 def import_expenses_from_xlsx(user_id: int, file_bytes: bytes):
     from openpyxl import load_workbook
     from io import BytesIO
@@ -587,7 +757,7 @@ def import_expenses_from_xlsx(user_id: int, file_bytes: bytes):
         return 0, 0
 
     header = rows[0]
-    col_info = []  # (kind, meta) per column: kind in {"note","month","event","skip"}
+    col_info = []
     for idx, h in enumerate(header):
         if idx == 0:
             col_info.append(("note", None))
@@ -639,29 +809,14 @@ def import_expenses_from_xlsx(user_id: int, file_bytes: bytes):
 
     return imported, skipped
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name.lower().endswith((".xlsx", ".xls")):
-        await update.message.reply_text("Send an .xlsx file to import expenses.")
-        return
-    await update.message.reply_text("📥 Importing... this may take a moment.")
-    user_id = update.effective_user.id
-    try:
-        file = await doc.get_file()
-        file_bytes = bytes(await file.download_as_bytearray())
-        imported, skipped = import_expenses_from_xlsx(user_id, file_bytes)
-    except Exception as e:
-        logger.error(f"Import failed for {user_id}: {e}")
-        await update.message.reply_text(f"❌ Import failed: {e}")
-        return
-    msg = f"✅ Imported {imported} transaction(s)."
-    if skipped:
-        msg += f" Skipped {skipped} row(s) with no note (e.g. totals rows)."
-    msg += "\n\nReview with the buttons below, or use /export to double check."
-    await update.message.reply_text(msg, reply_markup=make_keyboard())
+def _nearest_preceding_month(col_info, idx):
+    for i in range(idx - 1, -1, -1):
+        if col_info[i][0] == "month":
+            return col_info[i][1]
+    return None
 
+# ─── PERIODIC SYNC ─────────────────────────────────────────
 async def periodic_sync(application):
-    """Background task to sync with Google Sheets periodically"""
     while True:
         try:
             await asyncio.sleep(SYNC_INTERVAL)
@@ -680,18 +835,9 @@ async def periodic_sync(application):
 
 # ─── TELEGRAM BOT ENTRY ─────────────────────────────────────
 async def _post_init(app):
-    """PTB calls this once, after initialize() but before polling starts.
-    This is the correct place to schedule background asyncio tasks --
-    run_polling() owns the event loop, so we can't create tasks before it."""
     asyncio.create_task(periodic_sync(app))
 
 def main_telegram():
-    """Run the Telegram bot.
-    IMPORTANT: run_polling() is a BLOCKING call that creates and manages its
-    own event loop internally. It must be called directly, never awaited
-    inside asyncio.run()/another coroutine -- doing so causes PTB to crash
-    with 'RuntimeError: Cannot close a running event loop' once it tries to
-    tear down a loop that asyncio.run() is still managing."""
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -701,7 +847,8 @@ def main_telegram():
     app.add_handler(CommandHandler("setcat", cmd_setcat))
     app.add_handler(CommandHandler("listcats", cmd_listcats))
     app.add_handler(CommandHandler("setsheet", cmd_setsheet))
-    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("export", cmd_export))          # NEW: Excel export
+    app.add_handler(CommandHandler("exportcsv", cmd_exportcsv))    # legacy CSV
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -710,7 +857,6 @@ def main_telegram():
     app.run_polling()
 
 def run_telegram_bot():
-    """Entry point for Telegram bot in a separate process"""
     try:
         main_telegram()
     except KeyboardInterrupt:
