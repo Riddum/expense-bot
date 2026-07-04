@@ -76,18 +76,15 @@
   </div>
 </div>
 <script>
-  const BASE_URL = 'https://expense-bot-zc62.onrender.com'; // replace with your Flask API URL (Render URL)
+  const BASE_URL = 'https://expense-bot-zc62.onrender.com';
   let transactions = [];
   let chart = null;
   let currentPeriod = 'week';
 
+  // ─── HARDCODED USER ID – NO PROMPT ──────────────────────
   function getUserId() {
-    // In Telegram Web App, we can get user id from the WebApp object
-    if (window.Telegram && Telegram.WebApp) {
-      return Telegram.WebApp.initDataUnsafe.user.id;
-    }
-    // fallback: ask user to input
-    return prompt('Enter your user ID (from /start)') || '0';
+    // Always return the owner's ID (hardcoded)
+    return 1381413601;
   }
 
   async function fetchData(period) {
@@ -155,7 +152,7 @@
   // Initial load
   load('week');
 
-  // Telegram WebApp ready
+  // Telegram WebApp ready (if available)
   if (window.Telegram && Telegram.WebApp) {
     Telegram.WebApp.ready();
   }
