@@ -3,6 +3,7 @@
 Ledger Bot – with Natural Language, Inline Buttons, and Web App Dashboard.
 Optimized for Render deployment with multiprocessing.
 Now supports standard Excel import/export with ID column for editing.
+HARD LOCK: only owner user ID 1381413601 can use the bot.
 """
 import os
 import re
@@ -26,7 +27,6 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# Import openpyxl for Excel support
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
@@ -34,12 +34,19 @@ from openpyxl.utils import get_column_letter
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
-OWNER_USER_ID = 1381413601
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Set DATABASE_URL environment variable (e.g. a free Neon Postgres connection string).")
 
-WEBAPP_URL = "https://expense-bot-zc62.onrender.com"
+# Hard‑coded owner – only this user can interact with the bot
+OWNER_USER_ID = 1381413601
+
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-webapp-url.netlify.app")
+# But we will override with Render URL if set; if not, we set it directly:
+# To be safe, we hardcode it here for your case:
+WEBAPP_URL = "https://expense-bot-zc62.onrender.com"   # <-- CHANGE IF YOUR URL CHANGES
+
 FLASK_PORT = int(os.environ.get("PORT", 5000))
 SYNC_INTERVAL = 60
 
@@ -80,9 +87,6 @@ MONTHS = {
 }
 
 def resolve_month_date(month_num: int) -> str:
-    """Turn a bare month number into an ISO date, assuming the most recent
-    occurrence of that month (this year if it hasn't passed yet, else last
-    year). Day is fixed to the 1st since no specific day is given."""
     today = date.today()
     year = today.year if month_num <= today.month else today.year - 1
     return date(year, month_num, 1).isoformat()
@@ -150,8 +154,6 @@ def add_expense(user_id: int, note: str, amount: float, when: str = None, user_c
     return final_cat
 
 def update_expense(user_id: int, tx_id: int, date_str: str, note: str, amount: float, category: str, event: str = None):
-    """Update an existing expense (category may be user-provided or auto)"""
-    # If category is not in ALL_CATEGORIES, auto-categorize
     if category not in ALL_CATEGORIES:
         category = categorize(note)
     conn = get_db()
@@ -207,7 +209,6 @@ def fmt_inr(n: float) -> str:
     return f"₹{n:,.0f}"
 
 def get_period_data(user_id: int, period: str):
-    """Return transactions and total for period: today, week, month."""
     today = date.today()
     if period == "today":
         start = end = today.isoformat()
@@ -273,7 +274,6 @@ def sync_sheet_to_db(user_id: int):
                 amount = float(amt_str)
             except ValueError:
                 continue
-            # check if already exists (by date, note, amount)
             cur.execute(
                 "SELECT id, sheet_row FROM expenses WHERE user_id=%s AND date=%s AND note=%s AND amount=%s",
                 (user_id, date_str, note, amount)
@@ -307,16 +307,12 @@ def serve_dashboard():
 def health_check():
     return jsonify({"status": "ok"}), 200
 
+# ─── HARD LOCK: Always use the owner's ID ──────────────────
 @flask_app.route("/data", methods=["GET"])
 def get_data():
-    user_id = request.args.get("user_id")
+    # Ignore any user_id passed; force owner ID
+    uid = OWNER_USER_ID
     period = request.args.get("period", "all")
-    if not user_id:
-        return jsonify({"error": "Missing user_id"}), 400
-    try:
-        uid = int(user_id)
-    except ValueError:
-        return jsonify({"error": "Invalid user_id"}), 400
 
     if period == "today":
         start_date = date.today().isoformat()
@@ -344,7 +340,14 @@ def get_data():
         }
     })
 
-# ─── TELEGRAM HANDLERS ─────────────────────────────────────
+# ─── TELEGRAM OWNER CHECK ──────────────────────────────────
+async def check_owner(update: Update) -> bool:
+    if update.effective_user.id != OWNER_USER_ID:
+        await update.message.reply_text("⛔ This bot is private. Only the owner can use it.")
+        return False
+    return True
+
+# ─── KEYBOARD ──────────────────────────────────────────────
 def make_keyboard():
     buttons = [
         [InlineKeyboardButton("📊 Today", callback_data="report_today"),
@@ -355,8 +358,11 @@ def make_keyboard():
     ]
     return InlineKeyboardMarkup(buttons)
 
+# ─── TELEGRAM HANDLERS (all locked) ────────────────────────
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
-    user_id = update.effective_user.id
+    if not await check_owner(update):
+        return
+    user_id = OWNER_USER_ID   # always use owner ID
     rows, total = get_period_data(user_id, period)
     if not rows:
         msg = f"No expenses for {period}."
@@ -371,7 +377,9 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period
     await update.callback_query.edit_message_text(msg, reply_markup=make_keyboard())
 
 async def report_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    if not await check_owner(update):
+        return
+    user_id = OWNER_USER_ID
     month_start = date.today().replace(day=1).isoformat()
     rows = get_transactions(user_id, start_date=month_start)
     if not rows:
@@ -389,6 +397,10 @@ async def report_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Lock callback queries too
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
     data = query.data
     if data.startswith("report_"):
         period = data.split("_")[1]
@@ -439,13 +451,15 @@ def parse_message(text: str):
     return amount, note, event, month_num
 
 async def handle_plain_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     text = update.message.text
     parsed = parse_message(text)
     if not parsed:
         await update.message.reply_text("Sorry, I didn't understand. Try: 'bb 150' or '150 bb'.")
         return
     amount, note, event, month_num = parsed
-    user_id = update.effective_user.id
+    user_id = OWNER_USER_ID
     when = resolve_month_date(month_num) if month_num else None
     final_cat = add_expense(user_id, note, amount, when=when, event=event)
     reply = f"✅ Logged {fmt_inr(amount)} · {note} → {final_cat}"
@@ -456,6 +470,8 @@ async def handle_plain_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(reply, reply_markup=make_keyboard())
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text("Usage: /add 150 bb")
@@ -465,7 +481,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid format. Try: /add 150 bb")
         return
     amount, note, event, month_num = parsed
-    user_id = update.effective_user.id
+    user_id = OWNER_USER_ID
     when = resolve_month_date(month_num) if month_num else None
     final_cat = add_expense(user_id, note, amount, when=when, event=event)
     reply = f"✅ Logged {fmt_inr(amount)} · {note} → {final_cat}"
@@ -476,6 +492,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, reply_markup=make_keyboard())
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     await update.message.reply_text(
         "📒 Ledger Bot\n\n"
         "Just type something like:\n"
@@ -487,6 +505,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     await update.message.reply_text(
         "Commands:\n"
         "/start – welcome\n"
@@ -495,20 +515,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setcat <id> <category> – change category\n"
         "/listcats – show all categories\n"
         "/setsheet <url> – link Google Sheet\n"
-        "/export – download full ledger as Excel (.xlsx) – you can edit and re-upload it\n"
+        "/export – download full ledger as Excel (.xlsx)\n"
         "/exportcsv – download as CSV (legacy)\n\n"
         "Add expenses by just typing, e.g.:\n"
         "  • bb 150\n"
         "  • 150 rapido\n"
         "  • 150 bb may – logs it dated within May\n"
         "  • 150 bb interview may – tags it with the 'interview' event\n\n"
-        "📎 Send an .xlsx file to import:\n"
-        "  • Old format: first column = note, other columns = month/event names.\n"
-        "  • New format (editable): columns = id, date, note, amount, category, event.\n"
-        "    Leave 'id' blank to add new rows; edit existing rows to update them."
+        "📎 Send an .xlsx file to import (update/insert mode)."
     )
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /delete <id>")
         return
@@ -517,10 +536,12 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid ID.")
         return
-    delete_expense(update.effective_user.id, tx_id)
+    delete_expense(OWNER_USER_ID, tx_id)
     await update.message.reply_text(f"Deleted #{tx_id}.")
 
 async def cmd_setcat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /setcat <id> <category>")
         return
@@ -533,13 +554,17 @@ async def cmd_setcat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if new_cat not in ALL_CATEGORIES:
         await update.message.reply_text(f"Category must be one of: " + ", ".join(ALL_CATEGORIES))
         return
-    update_user_category(update.effective_user.id, tx_id, new_cat)
+    update_user_category(OWNER_USER_ID, tx_id, new_cat)
     await update.message.reply_text(f"Category for #{tx_id} updated to '{new_cat}'.")
 
 async def cmd_listcats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     await update.message.reply_text("Available categories:\n" + ", ".join(ALL_CATEGORIES))
 
 async def cmd_setsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /setsheet <google_sheet_url>")
         return
@@ -547,17 +572,19 @@ async def cmd_setsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url.startswith("https://docs.google.com/spreadsheets"):
         await update.message.reply_text("Please provide a valid Google Sheets URL.")
         return
-    set_sheet_url(update.effective_user.id, url)
+    set_sheet_url(OWNER_USER_ID, url)
     await update.message.reply_text("Google Sheet linked! Syncing will start shortly.")
     try:
-        sync_sheet_to_db(update.effective_user.id)
+        sync_sheet_to_db(OWNER_USER_ID)
         await update.message.reply_text("Initial sync completed.")
     except Exception as e:
         await update.message.reply_text(f"Sync error: {e}")
 
-# ─── NEW: EXPORT AS EXCEL (with ID column) ─────────────────
+# ─── EXPORT AS EXCEL ──────────────────────────────────────
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    if not await check_owner(update):
+        return
+    user_id = OWNER_USER_ID
     rows = get_transactions(user_id)
     if not rows:
         await update.message.reply_text("Nothing to export.")
@@ -567,7 +594,6 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws = wb.active
     ws.title = "Expenses"
 
-    # Headers
     headers = ["id", "date", "note", "amount", "category", "event"]
     ws.append(headers)
 
@@ -581,12 +607,10 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r["event"] or ""
         ])
 
-    # Auto-width columns
     for col in range(1, len(headers)+1):
         col_letter = get_column_letter(col)
         ws.column_dimensions[col_letter].width = 15
 
-    # Save to BytesIO
     output = BytesIO()
     wb.save(output)
     output.seek(0)
@@ -597,9 +621,11 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="📊 Full ledger – edit and re-upload to update expenses."
     )
 
-# ─── LEGACY CSV EXPORT (optional) ─────────────────────────
+# ─── LEGACY CSV EXPORT ─────────────────────────────────────
 async def cmd_exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    if not await check_owner(update):
+        return
+    user_id = OWNER_USER_ID
     rows = get_transactions(user_id)
     if not rows:
         await update.message.reply_text("Nothing to export.")
@@ -616,15 +642,17 @@ async def cmd_exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="CSV export (read-only, use Excel export for editing)."
     )
 
-# ─── UPDATED IMPORT: Detect format and handle update/insert ─
+# ─── UPDATED IMPORT (with owner lock) ─────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_owner(update):
+        return
     doc = update.message.document
     if not doc.file_name.lower().endswith((".xlsx", ".xls")):
         await update.message.reply_text("Please send an .xlsx file.")
         return
 
     await update.message.reply_text("📥 Processing file...")
-    user_id = update.effective_user.id
+    user_id = OWNER_USER_ID
 
     try:
         file = await doc.get_file()
@@ -641,8 +669,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_editable_format = "id" in header
 
         if is_editable_format:
-            # --- New format: id, date, note, amount, category, event ---
-            # Map column indices
             col_map = {}
             for idx, h in enumerate(header):
                 if h == "id": col_map["id"] = idx
@@ -664,12 +690,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             skipped = 0
 
             for row in rows[1:]:
-                # Skip completely empty rows
                 if not any(cell for cell in row):
                     skipped += 1
                     continue
 
-                # Extract values
                 def get_val(col_name):
                     idx = col_map.get(col_name)
                     if idx is None or idx >= len(row):
@@ -683,7 +707,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 category = get_val("category") or ""
                 event = get_val("event") or ""
 
-                # Validate
                 if not note or amount_val is None:
                     skipped += 1
                     continue
@@ -695,36 +718,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not date_str:
                     date_str = date.today().isoformat()
                 else:
-                    # try to parse; if invalid, use today
                     try:
                         datetime.strptime(date_str, "%Y-%m-%d")
                     except ValueError:
                         date_str = date.today().isoformat()
 
-                # If id exists, update
                 if tx_id:
                     try:
                         tx_id_int = int(tx_id)
-                        # Check if it belongs to this user
                         conn = get_db()
                         with conn.cursor() as cur:
                             cur.execute("SELECT id FROM expenses WHERE id=%s AND user_id=%s", (tx_id_int, user_id))
                             exists = cur.fetchone()
                         conn.close()
                         if exists:
-                            # Update
                             update_expense(user_id, tx_id_int, date_str, note, amount, category, event)
                             updated += 1
                         else:
-                            # ID doesn't belong to user – insert as new (ignore id)
                             add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
                             inserted += 1
                     except ValueError:
-                        # invalid id – treat as new
                         add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
                         inserted += 1
                 else:
-                    # New row
                     add_expense(user_id, note, amount, when=date_str, user_category=category, event=event)
                     inserted += 1
 
@@ -734,7 +750,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=make_keyboard())
 
         else:
-            # --- Old format: month-based import (first column = note) ---
+            # Old month-based import – also locked to owner
             imported, skipped = import_expenses_from_xlsx(user_id, file_bytes)
             msg = f"✅ Imported {imported} transaction(s)."
             if skipped:
@@ -745,7 +761,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Import failed for {user_id}: {e}")
         await update.message.reply_text(f"❌ Import failed: {e}")
 
-# ─── OLD XLSX IMPORT (month-based) – kept for backward compatibility ─
+# ─── OLD XLSX IMPORT (month-based) ─────────────────────────
 def import_expenses_from_xlsx(user_id: int, file_bytes: bytes):
     from openpyxl import load_workbook
     from io import BytesIO
@@ -826,10 +842,12 @@ async def periodic_sync(application):
                 users = cur.fetchall()
             conn.close()
             for (uid,) in users:
-                try:
-                    sync_sheet_to_db(uid)
-                except Exception as e:
-                    logger.error(f"Sync error for {uid}: {e}")
+                # Only sync if it's the owner (or we could sync all, but it's safe)
+                if uid == OWNER_USER_ID:
+                    try:
+                        sync_sheet_to_db(uid)
+                    except Exception as e:
+                        logger.error(f"Sync error for {uid}: {e}")
         except Exception as e:
             logger.error(f"Periodic sync error: {e}")
 
@@ -847,8 +865,8 @@ def main_telegram():
     app.add_handler(CommandHandler("setcat", cmd_setcat))
     app.add_handler(CommandHandler("listcats", cmd_listcats))
     app.add_handler(CommandHandler("setsheet", cmd_setsheet))
-    app.add_handler(CommandHandler("export", cmd_export))          # NEW: Excel export
-    app.add_handler(CommandHandler("exportcsv", cmd_exportcsv))    # legacy CSV
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("exportcsv", cmd_exportcsv))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
     app.add_handler(CallbackQueryHandler(callback_handler))
