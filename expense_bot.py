@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
-
+OWNER_USER_ID = 1381413601
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Set DATABASE_URL environment variable (e.g. a free Neon Postgres connection string).")
